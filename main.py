@@ -4,11 +4,20 @@ import os
 
 app = Flask(__name__)
 
+@app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    return response
+
 API_KEY = os.environ.get("PBX_API_KEY", "4f3b7c18-0a03-4ebe-98c6-9f204a9bcdcb-202651218369")
 PBX_BASE = "https://reportapi01.55pbx.com:50500"
 
-@app.route("/api/relatorio", methods=["GET"])
+@app.route("/api/relatorio", methods=["GET", "OPTIONS"])
 def relatorio():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
     dt_inicio = request.args.get("dt_inicio", "")
     dt_fim    = request.args.get("dt_fim", "")
     fila      = request.args.get("fila", "all_queues")
