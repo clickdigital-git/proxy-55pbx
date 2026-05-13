@@ -18,7 +18,6 @@ FILAS = {
     "nf":    "65f8adde8f420605ae9b2ac1"
 }
 
-# Armazena jobs em memória
 JOBS = {}
 
 @app.after_request
@@ -54,45 +53,95 @@ def sec_to_hms(sec):
     s = sec % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def resumir_r02(data):
-    calls = data.get("data_report02", [])
+def calcular_nps(promotores, neutros, detratores):
+    total = promotores + neutros + detratores
+    if total == 0:
+        return None
+    return round(((promotores - detratores) / total) * 100, 1)
+
+def extrair_nota(c):
+    try:
+        n = int(c.get("wh_question_3_2_NOTA_1_a_5"))
+        if 1 <= n <= 5:
+            return n
+    except (TypeError, ValueError):
+        pass
+    return None
+
+def classificar_nota(n):
+    if n == 5:
+        return "promotor"
+    elif n in (3, 4):
+        return "neutro"
+    elif n in (1, 2):
+        return "detrator"
+    return None
+
+def resumir_r02_com_nps(calls):
     atendidas   = [c for c in calls if c.get("type_call") == "call_attended"]
     abandonadas = [c for c in calls if c.get("type_call") == "call_abandoned"]
     n = len(atendidas)
     total_falado = sum(to_sec(c.get("call_time_spoken","0:0:0")) for c in atendidas)
     total_espera = sum(to_sec(c.get("call_time_waiting","0:0:0")) for c in atendidas)
+
     por_agente = {}
+    p_fila = n_fila = d_fila = 0
+
     for c in atendidas:
         nome = c.get("name","")
-        if not nome: continue
+        if not nome:
+            continue
         if nome not in por_agente:
-            por_agente[nome] = {"ligacoes": 0, "falado_sec": 0}
+            por_agente[nome] = {"ligacoes": 0, "falado_sec": 0, "p": 0, "n": 0, "d": 0}
         por_agente[nome]["ligacoes"]   += 1
         por_agente[nome]["falado_sec"] += to_sec(c.get("call_time_spoken","0:0:0"))
+        nota = extrair_nota(c)
+        if nota:
+            cls = classificar_nota(nota)
+            if cls == "promotor":
+                por_agente[nome]["p"] += 1
+                p_fila += 1
+            elif cls == "neutro":
+                por_agente[nome]["n"] += 1
+                n_fila += 1
+            elif cls == "detrator":
+                por_agente[nome]["d"] += 1
+                d_fila += 1
+
+    agentes_resumo = {}
+    for k, v in sorted(por_agente.items(), key=lambda x: -x[1]["ligacoes"]):
+        agentes_resumo[k] = {
+            "ligacoes":   v["ligacoes"],
+            "falado_min": round(v["falado_sec"]/60, 1),
+            "nps":        calcular_nps(v["p"], v["n"], v["d"]),
+            "promotores": v["p"],
+            "neutros":    v["n"],
+            "detratores": v["d"],
+            "respostas":  v["p"] + v["n"] + v["d"]
+        }
+
     return {
-        "total": len(calls),
-        "atendidas": n,
-        "abandonadas": len(abandonadas),
-        "taxa_atendimento": f"{round(n/len(calls)*100,1)}%" if calls else "0%",
+        "total":                  len(calls),
+        "atendidas":              n,
+        "abandonadas":            len(abandonadas),
+        "taxa_atendimento":       f"{round(n/len(calls)*100,1)}%" if calls else "0%",
         "tempo_medio_espera_sec": round(total_espera/n) if n else 0,
         "tempo_total_falado_sec": total_falado,
-        "por_agente": {
-            k: {"ligacoes": v["ligacoes"], "falado_min": round(v["falado_sec"]/60,1)}
-            for k, v in sorted(por_agente.items(), key=lambda x: -x[1]["ligacoes"])
-        }
+        "nps_fila":               calcular_nps(p_fila, n_fila, d_fila),
+        "nps_respostas":          p_fila + n_fila + d_fila,
+        "por_agente":             agentes_resumo
     }
 
 def resumir_r03(data):
     resultado = {}
     for a in data.get("data_report03", []):
         nome = a.get("name","")
-        if not nome: continue
+        if not nome:
+            continue
         resultado[nome] = {
-            "logado":        a.get("timeTotalLogged",""),
-            "falado":        a.get("timeTotalSpoken",""),
             "falado_sec":    to_sec(a.get("timeTotalSpoken","0:0:0")),
+            "ocioso_sec":    to_sec(a.get("timeIdle","0:0:0")),
             "pausa":         a.get("timeTotalPaused",""),
-            "ocioso":        a.get("timeIdle",""),
             "produtividade": a.get("productivity",""),
             "ligacoes":      a.get("attendedReceptive", 0),
             "recusas":       a.get("quantityRefusal", 0)
@@ -109,71 +158,93 @@ def processar_job(job_id, dt_inicio, dt_fim, filas_sel):
         for fila_nome in filas_sel:
             fila_id  = FILAS[fila_nome]
             dias_r02 = []
-            agentes_r03 = {}
-            erros = []
+            agentes  = {}
+            erros    = []
 
             d = d_ini
             while d <= d_fim:
                 ds = d.isoformat()
+
+                # report_02
                 try:
                     raw02 = buscar_pbx(fila_id, ds, "report_02")
-                    r = resumir_r02(raw02)
+                    calls = raw02.get("data_report02", [])
+                    r = resumir_r02_com_nps(calls)
                     r["data"] = ds
                     dias_r02.append(r)
                 except Exception as e:
                     erros.append({"data": ds, "tipo": "report_02", "erro": str(e)})
 
+                # report_03
                 try:
                     raw03 = buscar_pbx(fila_id, ds, "report_03")
                     for agente, dados in resumir_r03(raw03).items():
-                        if agente not in agentes_r03:
-                            agentes_r03[agente] = {
-                                "ligacoes_total": 0,
+                        if agente not in agentes:
+                            agentes[agente] = {
+                                "ligacoes_total":   0,
                                 "falado_sec_total": 0,
-                                "recusas_total": 0,
-                                "dias_com_atividade": 0,
+                                "ocioso_sec_total": 0,
+                                "recusas_total":    0,
+                                "dias_ativos":      0,
+                                "p_total": 0, "n_total": 0, "d_total": 0,
                                 "historico": []
                             }
-                        agentes_r03[agente]["ligacoes_total"]   += dados["ligacoes"]
-                        agentes_r03[agente]["falado_sec_total"] += dados["falado_sec"]
-                        agentes_r03[agente]["recusas_total"]    += dados["recusas"]
+                        agentes[agente]["ligacoes_total"]   += dados["ligacoes"]
+                        agentes[agente]["falado_sec_total"] += dados["falado_sec"]
+                        agentes[agente]["ocioso_sec_total"] += dados["ocioso_sec"]
+                        agentes[agente]["recusas_total"]    += dados["recusas"]
                         if dados["ligacoes"] > 0 or dados["falado_sec"] > 0:
-                            agentes_r03[agente]["dias_com_atividade"] += 1
-                        agentes_r03[agente]["historico"].append({
+                            agentes[agente]["dias_ativos"] += 1
+                        agentes[agente]["historico"].append({
                             "data":          ds,
                             "ligacoes":      dados["ligacoes"],
-                            "falado":        dados["falado"],
+                            "falado":        sec_to_hms(dados["falado_sec"]),
+                            "ocioso":        sec_to_hms(dados["ocioso_sec"]),
                             "produtividade": dados["produtividade"],
-                            "ocioso":        dados["ocioso"],
-                            "pausa":         dados["pausa"]
+                            "pausa":         dados["pausa"],
+                            "recusas":       dados["recusas"]
                         })
                 except Exception as e:
                     erros.append({"data": ds, "tipo": "report_03", "erro": str(e)})
 
                 d += timedelta(days=1)
 
+            # Acumula NPS por agente a partir dos dias
+            for dia in dias_r02:
+                for ag, v in dia.get("por_agente", {}).items():
+                    if ag in agentes:
+                        agentes[ag]["p_total"] += v.get("promotores", 0)
+                        agentes[ag]["n_total"] += v.get("neutros", 0)
+                        agentes[ag]["d_total"] += v.get("detratores", 0)
+
+            # Totais gerais
             total_calls      = sum(d["total"]                  for d in dias_r02)
             total_atend      = sum(d["atendidas"]              for d in dias_r02)
             total_aband      = sum(d["abandonadas"]            for d in dias_r02)
             total_falado_sec = sum(d["tempo_total_falado_sec"] for d in dias_r02)
+            total_p = sum(d.get("nps_respostas", 0) and 0 or 0 for d in dias_r02)
 
-            agentes_ligacoes = {}
-            for dia in dias_r02:
-                for agente, v in dia.get("por_agente", {}).items():
-                    if agente not in agentes_ligacoes:
-                        agentes_ligacoes[agente] = {"ligacoes": 0, "falado_min": 0.0}
-                    agentes_ligacoes[agente]["ligacoes"]   += v["ligacoes"]
-                    agentes_ligacoes[agente]["falado_min"] += v["falado_min"]
+            # NPS geral do período
+            gp = sum(agentes[a]["p_total"] for a in agentes)
+            gn = sum(agentes[a]["n_total"] for a in agentes)
+            gd = sum(agentes[a]["d_total"] for a in agentes)
 
-            produtividade_cons = {}
-            for agente, v in agentes_r03.items():
-                dias_ativos = v["dias_com_atividade"] or 1
-                produtividade_cons[agente] = {
-                    "ligacoes_total":      v["ligacoes_total"],
-                    "falado_total":        sec_to_hms(v["falado_sec_total"]),
-                    "media_ligacoes_dia":  round(v["ligacoes_total"] / dias_ativos, 1),
-                    "recusas_total":       v["recusas_total"],
-                    "historico_diario":    v["historico"]
+            # Ranking final de agentes
+            ranking = {}
+            for ag, v in sorted(agentes.items(), key=lambda x: -x[1]["ligacoes_total"]):
+                dias_ativos = v["dias_ativos"] or 1
+                ranking[ag] = {
+                    "ligacoes_total":     v["ligacoes_total"],
+                    "falado_total":       sec_to_hms(v["falado_sec_total"]),
+                    "ocioso_total":       sec_to_hms(v["ocioso_sec_total"]),
+                    "media_ligacoes_dia": round(v["ligacoes_total"] / dias_ativos, 1),
+                    "recusas_total":      v["recusas_total"],
+                    "nps":                calcular_nps(v["p_total"], v["n_total"], v["d_total"]),
+                    "nps_promotores":     v["p_total"],
+                    "nps_neutros":        v["n_total"],
+                    "nps_detratores":     v["d_total"],
+                    "nps_respostas":      v["p_total"] + v["n_total"] + v["d_total"],
+                    "historico_diario":   v["historico"]
                 }
 
             resultado["filas"][fila_nome] = {
@@ -182,12 +253,16 @@ def processar_job(job_id, dt_inicio, dt_fim, filas_sel):
                     "atendidas":        total_atend,
                     "abandonadas":      total_aband,
                     "taxa_atendimento": f"{round(total_atend/total_calls*100,1)}%" if total_calls else "0%",
-                    "total_falado":     sec_to_hms(total_falado_sec)
+                    "total_falado":     sec_to_hms(total_falado_sec),
+                    "nps_periodo":      calcular_nps(gp, gn, gd),
+                    "nps_promotores":   gp,
+                    "nps_neutros":      gn,
+                    "nps_detratores":   gd,
+                    "nps_respostas":    gp + gn + gd
                 },
-                "por_dia":               dias_r02,
-                "ranking_ligacoes":      dict(sorted(agentes_ligacoes.items(),   key=lambda x: -x[1]["ligacoes"])),
-                "produtividade_agentes": dict(sorted(produtividade_cons.items(), key=lambda x: -x[1]["ligacoes_total"])),
-                "erros": erros
+                "por_dia":    dias_r02,
+                "agentes":    ranking,
+                "erros":      erros
             }
 
         JOBS[job_id]["status"]    = "pronto"
@@ -229,13 +304,11 @@ def resumo_iniciar():
     t.start()
 
     dias = (d_fim - d_ini).days + 1
-    estimativa = dias * len(filas_sel) * 30
-
     return jsonify({
-        "job_id": job_id,
-        "status": "iniciando",
-        "estimativa_segundos": estimativa,
-        "consultar_em": f"/api/resumo/resultado/{job_id}"
+        "job_id":              job_id,
+        "status":              "iniciando",
+        "estimativa_segundos": dias * len(filas_sel) * 30,
+        "consultar_em":        f"/api/resumo/resultado/{job_id}"
     }), 202
 
 
@@ -245,7 +318,7 @@ def resumo_resultado(job_id):
     if not job:
         return jsonify({"erro": "Job nao encontrado"}), 404
     if job["status"] in ("iniciando", "processando"):
-        return jsonify({"status": job["status"], "mensagem": "Ainda processando, tente novamente em 30s"}), 202
+        return jsonify({"status": job["status"], "mensagem": "Ainda processando, tente em 30s"}), 202
     if job["status"] == "erro":
         return jsonify({"status": "erro", "erro": job["erro"]}), 500
     return jsonify({"status": "pronto", "resultado": job["resultado"]}), 200
