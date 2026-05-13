@@ -2,18 +2,13 @@ from flask import Flask, request, jsonify
 from datetime import date, timedelta
 import requests
 import os
+import uuid
+import threading
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
-
-@app.after_request
-def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    return response
 
 API_KEY = os.environ.get("PBX_API_KEY", "4f3b7c18-0a03-4ebe-98c6-9f204a9bcdcb-202651218369")
 PBX_BASE = "https://reportapi01.55pbx.com:50500"
@@ -22,6 +17,16 @@ FILAS = {
     "betel": "65241af636cb95f687fb1b06",
     "nf":    "65f8adde8f420605ae9b2ac1"
 }
+
+# Armazena jobs em memória
+JOBS = {}
+
+@app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    return response
 
 def buscar_pbx(fila_id, dt, tipo):
     url = (
@@ -94,8 +99,107 @@ def resumir_r03(data):
         }
     return resultado
 
-@app.route("/api/resumo", methods=["GET", "OPTIONS"])
-def resumo():
+def processar_job(job_id, dt_inicio, dt_fim, filas_sel):
+    try:
+        JOBS[job_id]["status"] = "processando"
+        d_ini = date.fromisoformat(dt_inicio)
+        d_fim = date.fromisoformat(dt_fim)
+        resultado = {"periodo": {"inicio": dt_inicio, "fim": dt_fim}, "filas": {}}
+
+        for fila_nome in filas_sel:
+            fila_id  = FILAS[fila_nome]
+            dias_r02 = []
+            agentes_r03 = {}
+            erros = []
+
+            d = d_ini
+            while d <= d_fim:
+                ds = d.isoformat()
+                try:
+                    raw02 = buscar_pbx(fila_id, ds, "report_02")
+                    r = resumir_r02(raw02)
+                    r["data"] = ds
+                    dias_r02.append(r)
+                except Exception as e:
+                    erros.append({"data": ds, "tipo": "report_02", "erro": str(e)})
+
+                try:
+                    raw03 = buscar_pbx(fila_id, ds, "report_03")
+                    for agente, dados in resumir_r03(raw03).items():
+                        if agente not in agentes_r03:
+                            agentes_r03[agente] = {
+                                "ligacoes_total": 0,
+                                "falado_sec_total": 0,
+                                "recusas_total": 0,
+                                "dias_com_atividade": 0,
+                                "historico": []
+                            }
+                        agentes_r03[agente]["ligacoes_total"]   += dados["ligacoes"]
+                        agentes_r03[agente]["falado_sec_total"] += dados["falado_sec"]
+                        agentes_r03[agente]["recusas_total"]    += dados["recusas"]
+                        if dados["ligacoes"] > 0 or dados["falado_sec"] > 0:
+                            agentes_r03[agente]["dias_com_atividade"] += 1
+                        agentes_r03[agente]["historico"].append({
+                            "data":          ds,
+                            "ligacoes":      dados["ligacoes"],
+                            "falado":        dados["falado"],
+                            "produtividade": dados["produtividade"],
+                            "ocioso":        dados["ocioso"],
+                            "pausa":         dados["pausa"]
+                        })
+                except Exception as e:
+                    erros.append({"data": ds, "tipo": "report_03", "erro": str(e)})
+
+                d += timedelta(days=1)
+
+            total_calls      = sum(d["total"]                  for d in dias_r02)
+            total_atend      = sum(d["atendidas"]              for d in dias_r02)
+            total_aband      = sum(d["abandonadas"]            for d in dias_r02)
+            total_falado_sec = sum(d["tempo_total_falado_sec"] for d in dias_r02)
+
+            agentes_ligacoes = {}
+            for dia in dias_r02:
+                for agente, v in dia.get("por_agente", {}).items():
+                    if agente not in agentes_ligacoes:
+                        agentes_ligacoes[agente] = {"ligacoes": 0, "falado_min": 0.0}
+                    agentes_ligacoes[agente]["ligacoes"]   += v["ligacoes"]
+                    agentes_ligacoes[agente]["falado_min"] += v["falado_min"]
+
+            produtividade_cons = {}
+            for agente, v in agentes_r03.items():
+                dias_ativos = v["dias_com_atividade"] or 1
+                produtividade_cons[agente] = {
+                    "ligacoes_total":      v["ligacoes_total"],
+                    "falado_total":        sec_to_hms(v["falado_sec_total"]),
+                    "media_ligacoes_dia":  round(v["ligacoes_total"] / dias_ativos, 1),
+                    "recusas_total":       v["recusas_total"],
+                    "historico_diario":    v["historico"]
+                }
+
+            resultado["filas"][fila_nome] = {
+                "resumo_geral": {
+                    "total_ligacoes":   total_calls,
+                    "atendidas":        total_atend,
+                    "abandonadas":      total_aband,
+                    "taxa_atendimento": f"{round(total_atend/total_calls*100,1)}%" if total_calls else "0%",
+                    "total_falado":     sec_to_hms(total_falado_sec)
+                },
+                "por_dia":               dias_r02,
+                "ranking_ligacoes":      dict(sorted(agentes_ligacoes.items(),   key=lambda x: -x[1]["ligacoes"])),
+                "produtividade_agentes": dict(sorted(produtividade_cons.items(), key=lambda x: -x[1]["ligacoes_total"])),
+                "erros": erros
+            }
+
+        JOBS[job_id]["status"]    = "pronto"
+        JOBS[job_id]["resultado"] = resultado
+
+    except Exception as e:
+        JOBS[job_id]["status"] = "erro"
+        JOBS[job_id]["erro"]   = str(e)
+
+
+@app.route("/api/resumo/iniciar", methods=["GET", "OPTIONS"])
+def resumo_iniciar():
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
@@ -111,99 +215,41 @@ def resumo():
     except:
         return jsonify({"erro": "Formato invalido. Use YYYY-MM-DD"}), 400
     if (d_fim - d_ini).days > 31:
-        return jsonify({"erro": "Periodo maximo: 31 dias por consulta"}), 400
+        return jsonify({"erro": "Periodo maximo: 31 dias"}), 400
 
     filas_sel = [f.strip() for f in filas_req.split(",") if f.strip() in FILAS]
     if not filas_sel:
         return jsonify({"erro": "Filas invalidas. Use: betel, nf"}), 400
 
-    resultado = {"periodo": {"inicio": dt_inicio, "fim": dt_fim}, "filas": {}}
+    job_id = str(uuid.uuid4())[:8]
+    JOBS[job_id] = {"status": "iniciando", "resultado": None, "erro": None}
 
-    for fila_nome in filas_sel:
-        fila_id  = FILAS[fila_nome]
-        dias_r02 = []
-        agentes_r03 = {}
-        erros = []
+    t = threading.Thread(target=processar_job, args=(job_id, dt_inicio, dt_fim, filas_sel))
+    t.daemon = True
+    t.start()
 
-        d = d_ini
-        while d <= d_fim:
-            ds = d.isoformat()
-            try:
-                raw02 = buscar_pbx(fila_id, ds, "report_02")
-                r = resumir_r02(raw02)
-                r["data"] = ds
-                dias_r02.append(r)
-            except Exception as e:
-                erros.append({"data": ds, "tipo": "report_02", "erro": str(e)})
+    dias = (d_fim - d_ini).days + 1
+    estimativa = dias * len(filas_sel) * 30
 
-            try:
-                raw03 = buscar_pbx(fila_id, ds, "report_03")
-                for agente, dados in resumir_r03(raw03).items():
-                    if agente not in agentes_r03:
-                        agentes_r03[agente] = {
-                            "ligacoes_total": 0,
-                            "falado_sec_total": 0,
-                            "recusas_total": 0,
-                            "dias_com_atividade": 0,
-                            "historico": []
-                        }
-                    agentes_r03[agente]["ligacoes_total"]    += dados["ligacoes"]
-                    agentes_r03[agente]["falado_sec_total"]  += dados["falado_sec"]
-                    agentes_r03[agente]["recusas_total"]     += dados["recusas"]
-                    if dados["ligacoes"] > 0 or dados["falado_sec"] > 0:
-                        agentes_r03[agente]["dias_com_atividade"] += 1
-                    agentes_r03[agente]["historico"].append({
-                        "data":          ds,
-                        "ligacoes":      dados["ligacoes"],
-                        "falado":        dados["falado"],
-                        "produtividade": dados["produtividade"],
-                        "ocioso":        dados["ocioso"],
-                        "pausa":         dados["pausa"]
-                    })
-            except Exception as e:
-                erros.append({"data": ds, "tipo": "report_03", "erro": str(e)})
+    return jsonify({
+        "job_id": job_id,
+        "status": "iniciando",
+        "estimativa_segundos": estimativa,
+        "consultar_em": f"/api/resumo/resultado/{job_id}"
+    }), 202
 
-            d += timedelta(days=1)
 
-        total_calls      = sum(d["total"]                for d in dias_r02)
-        total_atend      = sum(d["atendidas"]            for d in dias_r02)
-        total_aband      = sum(d["abandonadas"]          for d in dias_r02)
-        total_falado_sec = sum(d["tempo_total_falado_sec"] for d in dias_r02)
+@app.route("/api/resumo/resultado/<job_id>", methods=["GET"])
+def resumo_resultado(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"erro": "Job nao encontrado"}), 404
+    if job["status"] in ("iniciando", "processando"):
+        return jsonify({"status": job["status"], "mensagem": "Ainda processando, tente novamente em 30s"}), 202
+    if job["status"] == "erro":
+        return jsonify({"status": "erro", "erro": job["erro"]}), 500
+    return jsonify({"status": "pronto", "resultado": job["resultado"]}), 200
 
-        agentes_ligacoes = {}
-        for dia in dias_r02:
-            for agente, v in dia.get("por_agente", {}).items():
-                if agente not in agentes_ligacoes:
-                    agentes_ligacoes[agente] = {"ligacoes": 0, "falado_min": 0.0}
-                agentes_ligacoes[agente]["ligacoes"]   += v["ligacoes"]
-                agentes_ligacoes[agente]["falado_min"] += v["falado_min"]
-
-        produtividade_cons = {}
-        for agente, v in agentes_r03.items():
-            dias_ativos = v["dias_com_atividade"] or 1
-            produtividade_cons[agente] = {
-                "ligacoes_total":   v["ligacoes_total"],
-                "falado_total":     sec_to_hms(v["falado_sec_total"]),
-                "media_ligacoes_dia": round(v["ligacoes_total"] / dias_ativos, 1),
-                "recusas_total":    v["recusas_total"],
-                "historico_diario": v["historico"]
-            }
-
-        resultado["filas"][fila_nome] = {
-            "resumo_geral": {
-                "total_ligacoes":   total_calls,
-                "atendidas":        total_atend,
-                "abandonadas":      total_aband,
-                "taxa_atendimento": f"{round(total_atend/total_calls*100,1)}%" if total_calls else "0%",
-                "total_falado":     sec_to_hms(total_falado_sec)
-            },
-            "por_dia": dias_r02,
-            "ranking_ligacoes":      dict(sorted(agentes_ligacoes.items(),    key=lambda x: -x[1]["ligacoes"])),
-            "produtividade_agentes": dict(sorted(produtividade_cons.items(),  key=lambda x: -x[1]["ligacoes_total"])),
-            "erros": erros
-        }
-
-    return jsonify(resultado), 200
 
 @app.route("/api/relatorio", methods=["GET", "OPTIONS"])
 def relatorio():
@@ -229,9 +275,11 @@ def relatorio():
     except requests.exceptions.RequestException as e:
         return jsonify({"erro": str(e)}), 502
 
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
